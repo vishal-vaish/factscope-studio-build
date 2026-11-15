@@ -5,7 +5,7 @@ import { productionSchema } from "@/lib/production-schema";
 import { getComfySettings, submitWorkflow } from "@/lib/comfyui/client";
 import { validateImportedApiWorkflow } from "@/lib/workflow/validate-api";
 import { isComfyApiWorkflow } from "@/lib/workflow/inspect";
-import { loadImportedWorkflow, loadReferenceWorkflow } from "@/lib/workflow/storage";
+import { loadImportedWorkflow } from "@/lib/workflow/storage";
 import { requireLocalSameOrigin } from "@/lib/comfyui/request-guard";
 
 export const runtime = "nodejs";
@@ -28,7 +28,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const createdAt = Date.now();
   db.insert(jobs).values({ id: jobId, videoId, status: "preparing", promptId: null, error: null, output: null, createdAt }).run();
   const imported = await loadImportedWorkflow(videoId, "api");
-  const reference = await loadReferenceWorkflow(videoId);
   if (!imported || !isComfyApiWorkflow(imported.workflow)) {
     const failures = ["Import a ComfyUI API-format workflow and pass live compatibility validation before generating."];
     db.update(jobs).set({ status: "failed", error: failures.join("\\n") }).where(eq(jobs.id, jobId)).run();
@@ -39,7 +38,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     production: parsed.data,
     selectedModels: imported.state.selectedModels,
     supportingModels: imported.state.supportingModels,
-    reference: reference?.analysis || null,
   });
   if (!validation.valid || !validation.outputNodeId) {
     db.update(jobs).set({ status: "failed", error: validation.failures.join("\\n") }).where(eq(jobs.id, jobId)).run();

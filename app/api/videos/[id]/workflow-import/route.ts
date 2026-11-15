@@ -4,7 +4,7 @@ import { db, videos } from "@/lib/db";
 import { productionSchema } from "@/lib/production-schema";
 import { requireLocalHost, requireLocalSameOrigin } from "@/lib/comfyui/request-guard";
 import { analyzeImportedEditableWorkflow, isComfyApiWorkflow, isEditableComfyWorkflow } from "@/lib/workflow/inspect";
-import { listImportedWorkflows, loadImportedWorkflow, loadReferenceWorkflow, saveImportedWorkflow, type ImportState, type WorkflowKind } from "@/lib/workflow/storage";
+import { listImportedWorkflows, loadImportedWorkflow, saveImportedWorkflow, type ImportState, type WorkflowKind } from "@/lib/workflow/storage";
 import { validateImportedApiWorkflow } from "@/lib/workflow/validate-api";
 import type { WorkflowModelSelection } from "@/lib/workflow/request";
 
@@ -52,8 +52,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     validation = { valid: result.valid, failures: result.failures, warnings: result.warning ? [result.warning] : [], checkedAt: Date.now() };
   } else {
     if (!isComfyApiWorkflow(workflow)) return NextResponse.json({ error: "Expected ComfyUI API-format JSON: a node map whose nodes contain class_type and inputs." }, { status: 422 });
-    const reference = await loadReferenceWorkflow(id);
-    const result = await validateImportedApiWorkflow({ workflow, production: production.data, selectedModels: models, supportingModels: dependencies, reference: reference?.analysis || null });
+    const result = await validateImportedApiWorkflow({ workflow, production: production.data, selectedModels: models, supportingModels: dependencies });
     validation = { ...result, checkedAt: Date.now() };
   }
   const state: ImportState = { filename, kind: kind as WorkflowKind, uploadedAt: Date.now(), validation, selectedModels: models, supportingModels: dependencies };
@@ -73,13 +72,12 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
   if (!body || !modelSelection(body.selectedModels)) return NextResponse.json({ error: "Select image and video model filenames before validation." }, { status: 400 });
   const imported = await loadImportedWorkflow(id, "api");
   if (!imported || !isComfyApiWorkflow(imported.workflow)) return NextResponse.json({ error: "Upload a ComfyUI API workflow before validating it." }, { status: 404 });
-  const reference = await loadReferenceWorkflow(id);
   const supporting = body.supportingModels && typeof body.supportingModels === "object" ? body.supportingModels as { textEncoders?: unknown; vaeModels?: unknown } : {};
   const supportingModels = {
     textEncoders: Array.isArray(supporting.textEncoders) ? supporting.textEncoders.filter((item): item is string => typeof item === "string") : [],
     vaeModels: Array.isArray(supporting.vaeModels) ? supporting.vaeModels.filter((item): item is string => typeof item === "string") : [],
   };
-  const validation = await validateImportedApiWorkflow({ workflow: imported.workflow, production: production.data, selectedModels: body.selectedModels, supportingModels, reference: reference?.analysis || null });
+  const validation = await validateImportedApiWorkflow({ workflow: imported.workflow, production: production.data, selectedModels: body.selectedModels, supportingModels });
   const saved = await saveImportedWorkflow(id, "api", imported.state.filename, imported.workflow, { ...imported.state, selectedModels: body.selectedModels, supportingModels, validation: { ...validation, checkedAt: Date.now() } });
   return NextResponse.json({ workflow: saved });
 }

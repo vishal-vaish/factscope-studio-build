@@ -1,88 +1,97 @@
 import type { Production } from "@/lib/production-schema";
-import type { ReferenceAnalysis } from "@/lib/workflow/inspect";
+import { getImageModelPreset, getVideoModelPreset, type WorkflowModelSelection } from "@/lib/comfyui/model-presets";
 
-export type WorkflowModelSelection = { image: string; video: string };
+export type { WorkflowModelSelection } from "@/lib/comfyui/model-presets";
 
-export function buildWorkflowContext(production: Production, reference: ReferenceAnalysis, models: WorkflowModelSelection) {
+export function buildWorkflowContext(production: Production, models: WorkflowModelSelection, topic = production.title) {
+  const image = getImageModelPreset(models.image);
+  const video = getVideoModelPreset(models.video);
   return {
-    format: "factscope.workflow-context.v1",
+    format: "factscope.workflow-context.v2",
     generatedAt: new Date().toISOString(),
     production,
+    title: production.title,
+    topic,
     selectedModels: {
-      image: { filename: models.image, verification: "Unverified until present in the connected ComfyUI /object_info." },
-      video: { filename: models.video, verification: "Unverified until present in the connected ComfyUI /object_info." },
-      textEncoders: reference.models.textEncoder,
-      vaeModels: reference.models.vae,
-      audioModels: reference.models.audio,
+      image: { ...image, verification: "Known configuration only; installation and compatibility are unverified until checked against the connected ComfyUI /object_info." },
+      video: { ...video, verification: "Known configuration only; installation and compatibility are unverified until checked against the connected ComfyUI /object_info." },
     },
-    referenceWorkflow: reference,
-    providedReferenceExample: { sceneCount: 10, durationSeconds: 50, fps: 24, narrationLanguage: "Hindi", source: "User-provided example in the request; confirm against the attached graph before treating it as extracted metadata." },
-    executionCaveat: "ChatGPT-generated workflow files are untrusted inputs. FactScope must separately validate API node classes, input connections, models, configuration, and MP4 output against live ComfyUI /object_info before submission. Static compatibility checks do not prove a successful render.",
+    outputSpecifications: {
+      title: production.title,
+      topic,
+      durationSeconds: production.video.durationSeconds,
+      fps: production.video.fps,
+      width: production.video.width,
+      height: production.video.height,
+      aspectRatio: production.video.aspectRatio,
+      narrationLanguage: production.narration.language,
+      audioLanguage: production.audio.language,
+      finalFormat: "MP4",
+      sceneCount: production.scenes.length,
+    },
+    executionCaveat: "This context does not prove that model files or custom nodes are installed. Validate every API node class, input, connection, and model against live ComfyUI /object_info before submission. Static validation does not prove a successful render.",
   };
 }
 
-export function buildWorkflowRequest(production: Production, reference: ReferenceAnalysis, models: WorkflowModelSelection) {
-  const context = buildWorkflowContext(production, reference, models);
-  const nodeSummary = reference.nodes.slice(0, 100).map(node => `${node.id}: ${node.type}${node.title ? ` (${node.title})` : ""}${node.category.length ? ` [${node.category.join(", ")}]` : ""}`).join("\n") + (reference.nodes.length > 100 ? `\n… ${reference.nodes.length - 100} additional nodes are detailed in the context JSON; attach the original workflow for its full structure.` : "");
-  const measurementSummary = reference.measurements.length ? reference.measurements.map(item => `Node ${item.nodeId} ${item.input}: ${item.value} (${item.type})`).join("\n") : "No explicit FPS or duration values could be determined from named workflow inputs/properties.";
-  const encoderSummary = reference.models.textEncoder.length ? reference.models.textEncoder.join(", ") : "No text encoder filename was identified; inspect the attached workflow and report missing dependencies.";
-  const vaeSummary = reference.models.vae.length ? reference.models.vae.join(", ") : "No VAE filename was identified; inspect the attached workflow and report missing dependencies.";
-  const edges = reference.links.slice(0, 100).map(link => `${link.fromNodeId}:${link.fromSlot ?? "?"} → ${link.toNodeId}:${link.toSlot ?? "?"}${link.type ? ` (${link.type})` : ""}`).join("\n");
-  const sceneSummary = production.scenes.map(scene => `Scene ${scene.order} (${scene.startSeconds}-${scene.startSeconds + scene.durationSeconds}s): ${scene.title}`).join("\n");
-  const exampleDifference = `The user-provided example reference is described as 10 scenes, 50 seconds, 24 FPS, and Hindi narration (verify those details against the attached file). This Production JSON instead requests ${production.scenes.length} scenes, ${production.video.durationSeconds} seconds, ${production.video.fps} FPS, and ${production.narration.language} narration.`;
-  return `You are an expert ComfyUI workflow analyst and science-video pipeline designer. First inspect the attached original editable ComfyUI workflow file named "${reference.filename}". Do not create a graph until you have identified its actual node types, connections, model loaders, prompts, audio/video assembly stages, and output node. The node inventory and links below are a guide extracted from the file; the original attachment is authoritative.
+export function buildWorkflowRequest(production: Production, models: WorkflowModelSelection, topic = production.title) {
+  const context = buildWorkflowContext(production, models, topic);
+  return `You are an expert ComfyUI workflow engineer and scientific video pipeline designer. Build one complete, connected ComfyUI master workflow for the FactScope production below, without requiring or assuming an existing reference workflow. The user has imported this complete production brief; use its actual scene data, not a summary.
 
-TASK
-Adapt the reference workflow to the complete FactScope Production JSON below. Produce both requested workflow files, but do not claim they are valid or tested. Use only node types, input names, model capabilities, and connections supported by the reference graph or explicitly verified ComfyUI documentation/capabilities. If a required stage or dependency is absent or ambiguous, explain the limitation and leave it unimplemented rather than inventing custom nodes or capabilities.
+GOAL
+Create one end-to-end graph that processes all ${production.scenes.length} scenes as a single workflow submission and produces exactly one final MP4. Do not ask for manual per-scene jobs or split the work into separate workflows.
 
-PROJECT TARGET
+MODEL CONFIGURATION (filenames are configured preferences, NOT proof that files are installed)
+Image model preset: ${context.selectedModels.image.name}
+- Diffusion model: ${context.selectedModels.image.diffusionModel}
+- Text encoder: ${context.selectedModels.image.textEncoder}
+- VAE: ${context.selectedModels.image.vae}
+Video model preset: ${context.selectedModels.video.name}
+- Diffusion model: ${context.selectedModels.video.diffusionModel}
+- Text encoder: ${context.selectedModels.video.textEncoder}
+- Video VAE: ${context.selectedModels.video.videoVae}
+- Audio VAE: ${context.selectedModels.video.audioVae}
+
+TARGET
+- Title: ${production.title}
+- Topic: ${topic}
 - Scene count: ${production.scenes.length}
 - Total duration: ${production.video.durationSeconds} seconds
-- Target FPS: ${production.video.fps}
-- Target export resolution: ${production.video.width} × ${production.video.height} (${production.video.aspectRatio})
+- Target frame rate: ${production.video.fps} FPS
+- Target output: ${production.video.width} × ${production.video.height} (${production.video.aspectRatio})
+- Visual style: ${production.video.visualStyle}
 - Narration language: ${production.narration.language}; audio language: ${production.audio.language}
-- Reference-vs-project difference: ${exampleDifference}
-- Target MP4: one complete final MP4
-- Scene timeline:
-${sceneSummary}
+- Subtitles: ${production.audio.subtitlesEnabled ? "enabled if supported" : "not requested"}
+- Background music: ${production.audio.backgroundMusic ? "requested if supported" : "not requested"}
+- Final deliverable: one complete MP4
 
-SELECTED MODELS (provided by the user; installation is not verified)
-- Image: ${models.image}
-- Video: ${models.video}
-- Text encoders retained from the reference: ${encoderSummary}
-- VAE dependencies retained from the reference: ${vaeSummary}
-- Other audio model files detected: ${reference.models.audio.join(", ") || "None identified"}
+REQUIRED GRAPH
+1. Load the shared image/video model, text encoder(s), VAE(s), and audio dependencies using documented ComfyUI node classes and correct input names. Reuse shared loaders where supported.
+2. Generate an image for every scene from its full image prompt and negative prompt.
+3. Generate image-to-video motion for every scene from its full video prompt and negative prompt, using its scene image as conditioning.
+4. Preserve continuity across scenes using the supplied canonical subject description, fixed properties, continuity rules, and first/last-frame details. Use reference/identity conditioning only where supported by documented nodes and compatible model capabilities.
+5. Produce narration in the requested language, using narration text from the Production JSON. Use native text-to-speech only if a real compatible node/model is known; otherwise clearly identify the missing dependency and use a supported audio-loading path only if audio inputs are actually available. Do not fabricate audio or claim unsupported speech generation.
+6. Assemble every scene video in order with durations/frame counts calculated from the requested FPS and timestamps; concatenate them into one continuous timeline.
+7. Combine/align narration and optional audio with the full video timeline, and connect the result to exactly one final MP4 output node.
+8. Set target export FPS and resolution where supported. If native model dimensions or output nodes do not support the requested target, preserve native generation settings and explicitly identify the required upscale/resampling step or limitation rather than silently asserting support.
 
-REFERENCE WORKFLOW
-- Original filename: ${reference.filename}
-- Format: editable ComfyUI UI workflow JSON (not API execution format)
-- Nodes: ${reference.nodeCount}; links: ${reference.linkCount}
-- Existing explicit measurements:
-${measurementSummary}
-- Node IDs, types, and detected stages:
-${nodeSummary || "No nodes were detected."}
-- First ${Math.min(reference.links.length, 100)} connections:
-${edges || "No connections were detected."}
-- Detected workflow stages: ${Object.entries(reference.categories).filter(([, ids]) => ids.length).map(([category, ids]) => `${category}: ${ids.join(", ")}`).join("; ") || "No stage categories could be identified confidently."}
+REAL-NODE AND HONESTY REQUIREMENTS
+- Use only real, documented ComfyUI core node types or explicitly documented custom-node types. Do not invent node classes, input names, model capabilities, or installed dependencies.
+- Node availability, exact inputs, model installation, hardware fit, and runtime success are unknown unless verified against authoritative documentation or a live /object_info response. Clearly label all unknowns and list required custom-node packs and model files for verification.
+- If a required stage cannot be implemented with verified nodes, identify the gap instead of substituting a fake node or claiming a complete executable graph.
+- The API graph must use valid API-format class_type/inputs and actual node connections. The UI graph must be editable and correspond to the same graph.
+- Include every scene, prompt, narration segment, camera direction, timestamp, duration, continuity rule, and scientific constraint. Never omit or summarize scene content.
+- Ensure there is one final MP4 output, not one output per scene. Do not claim the workflow was tested or executed.
 
-REQUIRED TRANSFORMATIONS
-1. Analyze the attached reference graph before editing. Reuse its real node types and compatible connections; preserve its model loaders, required text encoders/VAE, verified audio-generation and audio-concatenation stages, frame/video concatenation, and final video-output stage when present.
-2. Replace old image prompts and video-motion prompts with the corresponding prompts from the new Production JSON. Adapt the graph to its ${production.scenes.length} scenes, preserving their order and complete timeline; do not retain old scene prompts.
-3. Preserve subject identity, canonical description, fixed properties, continuity, and scientific constraints. Keep narration and spoken dialogue in ${production.narration.language}; do not reuse the reference workflow's old dialogue language.
-4. Recalculate frame counts and clip durations from the Production JSON at the requested ${production.video.fps} FPS. The reference's native FPS and resolution are not assumed to support the requested values. The ${production.video.width}×${production.video.height} setting is the requested export resolution, not proof of native model generation resolution. Explain any required upscale, resampling, or unsupported setting instead of silently changing it.
-5. Verify the graph's scene continuity, dependency connections, frame/audio assembly, and exactly one final MP4 output node. Do not submit scenes as separate jobs.
-6. Do not invent custom nodes, input names, model support, or guaranteed compatibility. Explain every missing capability, dependency, or uncertainty. Do not state that either workflow was tested or executed unless it actually was.
+RETURN
+Return two complete JSON files as separate downloadable attachments, with no ellipses or omitted nodes:
+1. factscope_master_workflow.json — editable ComfyUI UI-format graph with nodes, links, widgets_values, and properties.
+2. factscope_master_workflow_api.json — API execution-format node map with class_type and inputs.
+Also provide a concise report of node/model dependencies, what is unverified, and any unsupported requirements. Both JSON files must represent the same complete scene-by-scene workflow. JSON syntax alone does not establish executability.
 
-OUTPUT FILES
-Return exactly two complete JSON files as separate downloadable attachments, with no omitted nodes or placeholder ellipses:
-1. factscope_master_workflow.json — editable ComfyUI UI-format graph containing nodes, links, widgets_values, and properties.
-2. factscope_master_workflow_api.json — ComfyUI API execution-format node map containing class_type and inputs.
-Also give a concise compatibility/limitations report. The UI graph and API graph must describe the same complete workflow. Valid JSON alone does not establish compatibility; FactScope will validate the API graph against the connected ComfyUI /object_info before submission.
-
-COMPLETE FACTSCOPE PRODUCTION JSON
+COMPLETE PRODUCTION JSON (authoritative; preserve all fields and scene data)
 \`\`\`json
 ${JSON.stringify(production, null, 2)}
 \`\`\`
 
-Workflow context JSON is available separately as "Download Workflow Context JSON". Keep this request readable; use the attached original workflow rather than pasting or summarizing away its full graph.`;
+The companion Workflow Context JSON includes the same Production JSON, selected presets and filenames, and output specifications.`;
 }

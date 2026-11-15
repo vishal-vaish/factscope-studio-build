@@ -2,7 +2,6 @@ import "server-only";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { dataDirectory } from "@/lib/db";
-import type { ReferenceAnalysis } from "@/lib/workflow/inspect";
 import type { WorkflowModelSelection } from "@/lib/workflow/request";
 import type { WorkflowCheck } from "@/lib/comfyui/workflow-validator";
 
@@ -31,34 +30,6 @@ async function atomicWrite(path: string, content: string) {
 export function safeWorkflowFilename(filename: string) {
   const lastPart = filename.split(/[\\/]/).pop() || "workflow.json";
   return lastPart.replace(/[^\p{L}\p{N}._ -]/gu, "_").slice(0, 180) || "workflow.json";
-}
-
-export async function saveReferenceWorkflow(videoId: string, filename: string, workflow: unknown, analysis: ReferenceAnalysis) {
-  const directory = directoryFor(videoId);
-  await mkdir(directory, { recursive: true });
-  const safeName = safeWorkflowFilename(filename);
-  await atomicWrite(join(directory, "reference.json"), JSON.stringify(workflow));
-  await atomicWrite(join(directory, "reference-metadata.json"), JSON.stringify({ filename: safeName, uploadedAt: Date.now(), analysis }));
-  return { filename: safeName, uploadedAt: Date.now(), analysis };
-}
-
-export async function loadReferenceWorkflow(videoId: string): Promise<{ filename: string; uploadedAt: number; analysis: ReferenceAnalysis; workflow: unknown } | null> {
-  try {
-    const directory = directoryFor(videoId);
-    const [metadata, raw] = await Promise.all([
-      readFile(join(directory, "reference-metadata.json"), "utf8"),
-      readFile(join(directory, "reference.json"), "utf8"),
-    ]);
-    const parsed = JSON.parse(metadata) as { filename: string; uploadedAt: number; analysis: ReferenceAnalysis };
-    return { ...parsed, workflow: JSON.parse(raw) as unknown };
-  } catch {
-    return null;
-  }
-}
-
-export async function downloadReferenceWorkflow(videoId: string) {
-  try { return await readFile(join(directoryFor(videoId), "reference.json")); }
-  catch { return null; }
 }
 
 export async function saveImportedWorkflow(videoId: string, kind: WorkflowKind, filename: string, workflow: unknown, state: ImportState) {

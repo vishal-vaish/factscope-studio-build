@@ -1,8 +1,8 @@
 import "server-only";
 import type { Production } from "@/lib/production-schema";
 import { comfyHeaders, getComfySettings } from "@/lib/comfyui/client";
-import { isComfyApiWorkflow, type ReferenceAnalysis } from "@/lib/workflow/inspect";
-import type { WorkflowModelSelection } from "@/lib/workflow/request";
+import { isComfyApiWorkflow } from "@/lib/workflow/inspect";
+import { getWorkflowSupportingModels, type WorkflowModelSelection } from "@/lib/comfyui/model-presets";
 import type { WorkflowCheck } from "@/lib/comfyui/workflow-validator";
 
 export type ApiWorkflowValidation = WorkflowCheck & { outputNodeId: string | null; verifiedClasses: string[] };
@@ -46,13 +46,27 @@ function matchesTargetConfig(workflow: Record<string, { class_type: string; inpu
   const entries = Object.entries(workflow);
   const graphText = JSON.stringify(workflow);
   for (const scene of production.scenes) {
-    if (!graphText.includes(scene.imagePrompt)) failures.push(`Scene ${scene.order} image prompt was not found in the imported API graph.`);
-    if (!graphText.includes(scene.videoPrompt)) failures.push(`Scene ${scene.order} motion prompt was not found in the imported API graph.`);
+    const requiredSceneContent = [
+      ["image prompt", scene.imagePrompt],
+      ["image negative prompt", scene.imageNegativePrompt],
+      ["video prompt", scene.videoPrompt],
+      ["video negative prompt", scene.videoNegativePrompt],
+      ["narration", scene.narration],
+      ["camera direction", scene.cameraMovement],
+      ["continuity description", scene.firstFrame],
+      ["continuity description", scene.lastFrame],
+    ] as const;
+    for (const [label, content] of requiredSceneContent) {
+      if (content.trim() && !graphText.includes(content)) failures.push(`Scene ${scene.order} ${label} was not found in the imported API graph.`);
+    }
+    for (const constraint of [...scene.continuityRules, ...scene.scientificConstraints]) {
+      if (constraint.trim() && !graphText.includes(constraint)) failures.push(`Scene ${scene.order} continuity/scientific constraint was not found in the imported API graph.`);
+    }
   }
   const allInputs = entries.flatMap(([, node]) => Object.entries(node.inputs).map(([name, value]) => ({ name: name.toLowerCase(), value })));
   const fpsInputs = allInputs.filter(item => /(^|_)(fps|frame_rate|framerate)(_|$)/.test(item.name) && typeof item.value === "number");
   for (const item of fpsInputs) if (item.value !== production.video.fps) failures.push(`Frame-rate input ${item.name} is ${item.value}; the project requests ${production.video.fps} FPS.`);
-  if (!fpsInputs.length) warnings.push(`The API graph has no plainly named FPS input to compare with the requested ${production.video.fps} FPS; confirm the reference workflow's native/output frame-rate behavior.`);
+  if (!fpsInputs.length) warnings.push(`The API graph has no plainly named FPS input to compare with the requested ${production.video.fps} FPS; confirm the graph's native/output frame-rate behavior.`);
   const expectedFrameCounts = new Set([...production.scenes.map(scene => Math.round(scene.durationSeconds * production.video.fps)), Math.round(production.video.durationSeconds * production.video.fps)]);
   const frameInputs = allInputs.filter(item => /^(num_?)?frames?$|^(num_?)?frame_count$|^total_frames$/.test(item.name) && typeof item.value === "number");
   for (const item of frameInputs) if (!expectedFrameCounts.has(Number(item.value))) failures.push(`Frame-count input ${item.name} is ${item.value}; expected a scene frame count (${production.video.fps} FPS) or the complete ${Math.round(production.video.durationSeconds * production.video.fps)}-frame timeline.`);
@@ -72,16 +86,19 @@ function matchesTargetConfig(workflow: Record<string, { class_type: string; inpu
   for (const item of sceneCountInputs) if (item.value !== production.scenes.length) failures.push(`Scene-count input ${item.name} is ${item.value}; the Production JSON has ${production.scenes.length} scenes.`);
 }
 
-export async function validateImportedApiWorkflow({ workflow, production, selectedModels, supportingModels, reference }: {
+export async function validateImportedApiWorkflow({ workflow, production, selectedModels, supportingModels }: {
   workflow: unknown;
   production: Production;
   selectedModels: WorkflowModelSelection;
   supportingModels: { textEncoders: string[]; vaeModels: string[] };
-  reference: ReferenceAnalysis | null;
 }): Promise<ApiWorkflowValidation> {
   const failures: string[] = [];
   const warnings = ["Passing static checks does not prove VRAM fit, runtime success, or a completed video render."];
   if (!isComfyApiWorkflow(workflow)) return { valid: false, failures: ["Expected a ComfyUI API-format node map with class_type and inputs on every node; editable UI-format JSON cannot be submitted to /prompt."], warnings, outputNodeId: null, verifiedClasses: [] };
+  let expectedSupportingModels: { textEncoders: string[]; vaeModels: string[] };
+  try { expectedSupportingModels = getWorkflowSupportingModels(selectedModels); }
+  catch (error) { return { valid: false, failures: [error instanceof Error ? error.message : "Select configured model presets before validation."], warnings, outputNodeId: null, verifiedClasses: [] }; }
+  if (JSON.stringify(supportingModels) !== JSON.stringify(expectedSupportingModels)) return { valid: false, failures: ["Supporting model filenames do not match the selected configured presets."], warnings, outputNodeId: null, verifiedClasses: [] };
   let endpoint: string;
   let token: string | undefined;
   try { ({ endpoint, token } = getComfySettings()); }
@@ -151,11 +168,6 @@ export async function validateImportedApiWorkflow({ workflow, production, select
     if (isVideoOutput && hasMp4Setting) mp4OutputNodeIds.push(nodeId);
   }
 
-  if (!reference) failures.push("Upload an editable reference workflow before validating an API graph so its model and assembly dependencies can be checked.");
-  const referenceImageModels = new Set(reference?.models.image || []);
-  const referenceVideoModels = new Set(reference?.models.video || []);
-  if (selectedModels.image && !referenceImageModels.has(selectedModels.image)) failures.push(`Selected image model "${selectedModels.image}" was not detected as an image model in the uploaded reference workflow.`);
-  if (selectedModels.video && !referenceVideoModels.has(selectedModels.video)) failures.push(`Selected video model "${selectedModels.video}" was not detected as a video model in the uploaded reference workflow.`);
   const selections = [
     { label: "image", filename: selectedModels.image },
     { label: "video", filename: selectedModels.video },
@@ -163,7 +175,7 @@ export async function validateImportedApiWorkflow({ workflow, production, select
     ...supportingModels.vaeModels.map(filename => ({ label: "VAE", filename })),
   ];
   for (const selection of selections) {
-    if (!selection.filename) { failures.push(`Select an exact ${selection.label} filename from the reference workflow.`); continue; }
+    if (!selection.filename) { failures.push(`Select a configured ${selection.label} filename before validation.`); continue; }
     if (!modelValues.has(selection.filename)) failures.push(`Selected ${selection.label} model "${selection.filename}" is not assigned to a model-like input in the imported API graph.`);
     if (!installedModelValues.has(selection.filename)) failures.push(`Selected ${selection.label} model "${selection.filename}" is not listed as installed by ComfyUI /object_info.`);
   }
@@ -171,16 +183,6 @@ export async function validateImportedApiWorkflow({ workflow, production, select
   if (mp4OutputNodeIds.length > 1) failures.push(`Expected one final MP4 output node, found ${mp4OutputNodeIds.length}: ${mp4OutputNodeIds.join(", ")}.`);
   outputNodeId = mp4OutputNodeIds[0] || null;
   if (outputNodeId && !connections.some(connection => connection.targetId === outputNodeId)) failures.push(`Final MP4 output node ${outputNodeId} has no connected workflow inputs.`);
-  if (reference) {
-    const referenceStages = ["audio generation", "audio concatenation", "frame concatenation"];
-    for (const stage of referenceStages) {
-      const referenceTypes = new Set(reference.nodes.filter(node => node.category.includes(stage)).map(node => node.type));
-      if (referenceTypes.size && !Object.entries(workflow).some(([, node]) => referenceTypes.has(node.class_type))) failures.push(`The API graph does not preserve a reference ${stage} node type (${[...referenceTypes].join(", ")}).`);
-    }
-    const referenceVideoTypes = new Set(reference.nodes.filter(node => node.category.includes("video output")).map(node => node.type));
-    if (referenceVideoTypes.size && !Object.entries(workflow).some(([, node]) => referenceVideoTypes.has(node.class_type))) failures.push(`The API graph does not preserve a reference video output node (${[...referenceVideoTypes].join(", ")}).`);
-  }
-
   matchesTargetConfig(workflow, production, failures, warnings);
   return { valid: failures.length === 0, failures: [...new Set(failures)], warnings: [...new Set(warnings)], outputNodeId, verifiedClasses: [...usedClasses] };
 }
