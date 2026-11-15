@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 import { db, jobs, randomUUID, videos } from "@/lib/db";
 import { desc, eq } from "drizzle-orm";
 import { productionSchema } from "@/lib/production-schema";
-import { buildWorkflow, WorkflowPreparationError } from "@/lib/comfyui/workflow-builder";
 import { getComfySettings, submitWorkflow } from "@/lib/comfyui/client";
+import { validateImportedApiWorkflow } from "@/lib/workflow/validate-api";
+import { isComfyApiWorkflow } from "@/lib/workflow/inspect";
+import { loadImportedWorkflow, loadReferenceWorkflow } from "@/lib/workflow/storage";
 import { requireLocalSameOrigin } from "@/lib/comfyui/request-guard";
 
 export const runtime = "nodejs";
@@ -25,14 +27,26 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const jobId = randomUUID();
   const createdAt = Date.now();
   db.insert(jobs).values({ id: jobId, videoId, status: "preparing", promptId: null, error: null, output: null, createdAt }).run();
-  let workflow;
-  try { workflow = await buildWorkflow(parsed.data); }
-  catch (error) {
-    const failures = error instanceof WorkflowPreparationError ? error.failures : [error instanceof Error ? error.message : "Workflow preparation failed."];
+  const imported = await loadImportedWorkflow(videoId, "api");
+  const reference = await loadReferenceWorkflow(videoId);
+  if (!imported || !isComfyApiWorkflow(imported.workflow)) {
+    const failures = ["Import a ComfyUI API-format workflow and pass live compatibility validation before generating."];
     db.update(jobs).set({ status: "failed", error: failures.join("\\n") }).where(eq(jobs.id, jobId)).run();
-    return NextResponse.json({ error: failures }, { status: 422 });
+    return NextResponse.json({ error: failures, jobId }, { status: 422 });
   }
-  db.update(jobs).set({ status: "submitting" }).where(eq(jobs.id, jobId)).run();
+  const validation = await validateImportedApiWorkflow({
+    workflow: imported.workflow,
+    production: parsed.data,
+    selectedModels: imported.state.selectedModels,
+    supportingModels: imported.state.supportingModels,
+    reference: reference?.analysis || null,
+  });
+  if (!validation.valid || !validation.outputNodeId) {
+    db.update(jobs).set({ status: "failed", error: validation.failures.join("\\n") }).where(eq(jobs.id, jobId)).run();
+    return NextResponse.json({ error: validation.failures, validation, jobId }, { status: 422 });
+  }
+  const workflow = imported.workflow;
+  db.update(jobs).set({ status: "submitting", output: JSON.stringify({ outputNodeId: validation.outputNodeId }) }).where(eq(jobs.id, jobId)).run();
   try {
     const { endpoint, token } = getComfySettings();
     const { promptId } = await submitWorkflow(workflow, endpoint, token, `factscope-${jobId}`);

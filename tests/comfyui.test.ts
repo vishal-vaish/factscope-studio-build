@@ -7,6 +7,9 @@ import { applySceneBindings, buildWorkflow, WorkflowPreparationError } from "@/l
 import { validateWorkflow, type ApiWorkflow } from "@/lib/comfyui/workflow-validator";
 import { findMp4Output, isVerifiedMp4Response, submitWorkflow } from "@/lib/comfyui/client";
 import { eq } from "drizzle-orm";
+import { inspectReferenceWorkflow, isComfyApiWorkflow, isEditableComfyWorkflow, analyzeImportedEditableWorkflow } from "@/lib/workflow/inspect";
+import { buildWorkflowContext, buildWorkflowRequest } from "@/lib/workflow/request";
+import { validateImportedApiWorkflow } from "@/lib/workflow/validate-api";
 
 function makeProduction(sceneCount = 6): Production {
   const duration = 30 / sceneCount;
@@ -94,4 +97,110 @@ test("only an MP4 reference at the configured output node is accepted", () => {
   assert.equal(findMp4Output(history, "98"), null);
   assert.equal(isVerifiedMp4Response(output!, new Response(new Uint8Array([0, 0, 0, 12, 102, 116, 121, 112]), { status: 200, headers: { "content-type": "video/mp4" } })), true);
   assert.equal(isVerifiedMp4Response(output!, new Response("not mp4", { status: 200, headers: { "content-type": "text/html" } })), false);
+});
+
+const referenceImage = "qwen_image_2.1_int8_convrot.safetensors";
+const referenceVideo = "minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+const referenceEncoder = "qwen_2.5_vl_7b_fp8_scaled.safetensors";
+const referenceVae = "qwen_image_vae.safetensors";
+
+function makeReference() {
+  return inspectReferenceWorkflow({
+    nodes: [
+      { id: 1, type: "ImageModelLoader", inputs: [], widgets_values: [referenceImage], properties: {} },
+      { id: 2, type: "VideoModelLoader", inputs: [], widgets_values: [referenceVideo], properties: {} },
+      { id: 3, type: "TextEncoderLoader", inputs: [], widgets_values: [referenceEncoder], properties: {} },
+      { id: 4, type: "VAELoader", inputs: [], widgets_values: [referenceVae], properties: {} },
+      { id: 5, type: "AudioGeneration", inputs: [], widgets_values: [], properties: {} },
+      { id: 6, type: "AudioConcat", inputs: [], widgets_values: [], properties: {} },
+      { id: 7, type: "FrameConcat", inputs: [], widgets_values: [], properties: {} },
+      { id: 8, type: "VideoSave", inputs: [], widgets_values: [], properties: {} },
+    ],
+    links: [[1, 1, 0, 3, 0, "MODEL"]],
+  }, "reference-workflow.json");
+}
+
+test("reference inspector distinguishes editable UI graphs and extracts models, nodes, links, and stages", () => {
+  const reference = makeReference();
+  assert.deepEqual(reference.models.image, [referenceImage]);
+  assert.deepEqual(reference.models.video, [referenceVideo]);
+  assert.deepEqual(reference.models.textEncoder, [referenceEncoder]);
+  assert.deepEqual(reference.models.vae, [referenceVae]);
+  assert.equal(reference.nodeCount, 8);
+  assert.equal(reference.linkCount, 1);
+  assert.ok(reference.categories["audio generation"].includes("5"));
+  assert.ok(reference.categories["audio concatenation"].includes("6"));
+  assert.ok(reference.categories["frame concatenation"].includes("7"));
+  assert.ok(reference.categories["video output"].includes("8"));
+  assert.equal(isEditableComfyWorkflow({ nodes: [], links: [] }), true);
+  assert.equal(isComfyApiWorkflow({ "1": { class_type: "Loader", inputs: {} } }), true);
+  assert.equal(isEditableComfyWorkflow({ "1": { class_type: "Loader", inputs: {} } }), false);
+  assert.equal(analyzeImportedEditableWorkflow({ nodes: [{ id: 1, type: "Node" }], links: [[1, 1, 0, 9, 0, "MODEL"]] }).valid, false);
+});
+
+test("ChatGPT request and context preserve exact models, complete Production JSON, and caveats", () => {
+  const production = makeProduction();
+  const reference = makeReference();
+  const models = { image: referenceImage, video: referenceVideo };
+  const request = buildWorkflowRequest(production, reference, models);
+  const context = buildWorkflowContext(production, reference, models);
+  assert.match(request, /First inspect the attached original editable ComfyUI workflow/);
+  assert.match(request, /10 scenes, 50 seconds, 24 FPS, and Hindi narration/);
+  assert.match(request, /qwen_image_2\.1_int8_convrot\.safetensors/);
+  assert.match(request, /minimax_h3_fl2va_pruned_int8_convrot\.safetensors/);
+  assert.match(request, /factscope_master_workflow_api\.json/);
+  assert.equal(context.production.scenes.length, 6);
+  assert.deepEqual(context.selectedModels.textEncoders, [referenceEncoder]);
+  assert.match(context.executionCaveat, /do not prove/);
+});
+
+test("imported API workflow checks real class inputs, selected models, prompts, FPS, and one MP4 output", async () => {
+  const production = makeProduction();
+  const reference = makeReference();
+  const prompts = production.scenes.flatMap(scene => [scene.imagePrompt, scene.videoPrompt]).join("\n");
+  const workflow: ApiWorkflow = {
+    "1": { class_type: "ImageModelLoader", inputs: { image_model: referenceImage } },
+    "2": { class_type: "VideoModelLoader", inputs: { video_model: referenceVideo } },
+    "3": { class_type: "TextEncoderLoader", inputs: { text_encoder_name: referenceEncoder } },
+    "4": { class_type: "VAELoader", inputs: { vae_name: referenceVae } },
+    "5": { class_type: "AudioGeneration", inputs: {} },
+    "6": { class_type: "AudioConcat", inputs: {} },
+    "7": { class_type: "FrameConcat", inputs: {} },
+    "8": { class_type: "PromptNode", inputs: { text: prompts, frame_rate: 24, output_width: 1080, output_height: 1920, frame_count: 120 } },
+    "9": { class_type: "VideoSave", inputs: { images: ["7", 0], format: "video/h264-mp4" } },
+  };
+  const objectInfo = {
+    ImageModelLoader: { input: { required: { image_model: [[referenceImage], {}] } }, output: ["MODEL"] },
+    VideoModelLoader: { input: { required: { video_model: [[referenceVideo], {}] } }, output: ["MODEL"] },
+    TextEncoderLoader: { input: { required: { text_encoder_name: [[referenceEncoder], {}] } }, output: ["CLIP"] },
+    VAELoader: { input: { required: { vae_name: [[referenceVae], {}] } }, output: ["VAE"] },
+    AudioGeneration: { input: { required: {} }, output: ["AUDIO"] },
+    AudioConcat: { input: { required: {} }, output: ["AUDIO"] },
+    FrameConcat: { input: { required: {} }, output: ["IMAGE"] },
+    PromptNode: { input: { required: { text: ["STRING", {}], frame_rate: ["INT", {}], output_width: ["INT", {}], output_height: ["INT", {}], frame_count: ["INT", {}] } }, output: ["STRING"] },
+    VideoSave: { input: { required: { images: ["IMAGE", {}], format: [["video/h264-mp4"], {}] } }, output: [], output_node: true },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify(objectInfo), { status: 200 });
+  try {
+    const result = await validateImportedApiWorkflow({ workflow, production, selectedModels: { image: referenceImage, video: referenceVideo }, supportingModels: { textEncoders: [referenceEncoder], vaeModels: [referenceVae] }, reference });
+    assert.equal(result.valid, true, result.failures.join("\n"));
+    assert.equal(result.outputNodeId, "9");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("API workflow import blocks unavailable classes, dangling links, and missing MP4 output", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ VideoSave: { input: { required: { images: ["IMAGE", {}], format: [["mp4"], {}] } }, output: [], output_node: true } }), { status: 200 });
+  try {
+    const result = await validateImportedApiWorkflow({
+      workflow: { "1": { class_type: "MissingNode", inputs: {} }, "2": { class_type: "VideoSave", inputs: { images: ["99", 0], format: "gif" } } },
+      production: makeProduction(), selectedModels: { image: referenceImage, video: referenceVideo }, supportingModels: { textEncoders: [], vaeModels: [] }, reference: makeReference(),
+    });
+    assert.equal(result.valid, false);
+    assert.ok(result.failures.some(failure => failure.includes("MissingNode")));
+    assert.ok(result.failures.some(failure => failure.includes("missing node 99")));
+    assert.ok(result.failures.some(failure => failure.includes("not an available option")));
+    assert.ok(result.failures.some(failure => failure.includes("configured for MP4")));
+  } finally { globalThis.fetch = originalFetch; }
 });

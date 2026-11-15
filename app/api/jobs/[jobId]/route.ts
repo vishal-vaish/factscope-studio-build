@@ -49,7 +49,8 @@ export async function GET(request: Request, { params }: { params: Promise<{ jobI
       return NextResponse.json(publicJob(db.select().from(jobs).where(eq(jobs.id, jobId)).get()!));
     }
 
-    const outputId = comfyConfig.expectedMp4OutputNodeId;
+    const persistedOutputState = job.output ? JSON.parse(job.output) as { outputNodeId?: unknown } : {};
+    const outputId = typeof persistedOutputState.outputNodeId === "string" ? persistedOutputState.outputNodeId : comfyConfig.expectedMp4OutputNodeId;
     const output = outputId ? findMp4Output(history, outputId) : null;
     if (output) {
       const fileResponse = await fetchOutput(output, endpoint, token);
